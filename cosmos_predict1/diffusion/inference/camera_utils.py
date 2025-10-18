@@ -17,6 +17,8 @@ import torch
 import math
 import torch.nn.functional as F
 from .forward_warp_utils_pytorch import unproject_points
+from scipy.spatial.transform import Rotation as R
+import numpy as np
 
 def apply_transformation(Bx4x4, another_matrix):
     B = Bx4x4.shape[0]
@@ -87,6 +89,180 @@ def create_horizontal_trajectory(
     trajectory = torch.stack(trajectory)
     return apply_transformation(trajectory, world_to_camera_matrix)
 
+def slerp(q1,q2,t):
+    dot = torch.dot(q1,q2)
+    if dot < 0.0:
+        q2 = -q2
+        dot = -dot
+    DOT_THRESHOLD = 0.9995
+    if dot > DOT_THRESHOLD:
+        return torch.nn.functional.normalize(q1 + t*(q2-q1),dim=0)
+    theta_0 = torch.acos(dot)
+    sin_theta_0 = torch.sin(theta_0)
+    theta_t = theta_0 * t
+    s0 = torch.sin(theta_0 - theta_t) / sin_theta_0
+    s1 = torch.sin(theta_t) / sin_theta_0
+    return s0 * q1 + s1 * q2
+
+def pose_from_quaternion(position, quaternion):
+    """Convert position + quaternion to 4x4 homogeneous matrix."""
+    x, y, z, w = quaternion
+    R = torch.tensor([
+        [1 - 2*(y*y + z*z), 2*(x*y - z*w),     2*(x*z + y*w)],
+        [2*(x*y + z*w),     1 - 2*(x*x + z*z), 2*(y*z - x*w)],
+        [2*(x*z - y*w),     2*(y*z + x*w),     1 - 2*(x*x + y*y)]
+    ])
+    T = torch.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = position
+    return T
+
+def convert_tartanair_to_gen3c(pos, quat):
+    R_convert = torch.tensor([[0, 1, 0],
+                              [0, 0, 1],
+                              [1, 0, 0]], dtype=torch.float32, device=pos.device)
+    pos_new = R_convert @ pos
+
+    R_orig = R.from_quat(quat.cpu().numpy())  # TartanAir quaternion x,y,z,w
+    R_matrix_new = R_convert.cpu().numpy() @ R_orig.as_matrix()
+    quat_new = torch.tensor(R.from_matrix(R_matrix_new).as_quat(), device=pos.device)  # x,y,z,w
+    return pos_new, quat_new
+
+def create_posed_trajectory(
+    world_to_camera_matrix, poses_file, n_steps, device="cuda"):
+    #center_depth = 5.0
+    #look_at = torch.tensor([0.0, 0.0, center_depth]).to(device)
+    #trajectory = []
+    #translational_positions = []
+    #initial_camera_pose = torch.tensor([0,0,0],device=device)
+
+    #we do not give explicit poses,
+    #we give intermediate poses...
+    poses = []
+    with open(poses_file, 'r') as f:
+        for line in f:
+            values = [round(float(x),2) for x in line.strip().split()]
+            poses.append(values)
+    poses = torch.tensor(poses, dtype=torch.float32, device=device)
+
+    n_segments = poses.shape[0] - 1
+    steps_per_segment = (n_steps - 1) // n_segments
+
+    trajectory = []
+    for i in range(n_segments):
+        p0, p1 = poses[i], poses[i+1]
+        pos0, quat0 = p0[:3], torch.nn.functional.normalize(p0[3:],dim=0)
+        pos1, quat1 = p1[:3], torch.nn.functional.normalize(p1[3:],dim=0)
+
+        #convert frame
+        pos0, quat0 = convert_tartanair_to_gen3c(pos0, quat0)
+        pos1, quat1 = convert_tartanair_to_gen3c(pos1, quat1)
+
+        for j in range(steps_per_segment):
+            t = j / steps_per_segment
+            pos_interp = (1-t) * pos0 + t*pos1
+            quat_interp = slerp(quat0, quat1, t)
+            pose_matrix = pose_from_quaternion(pos_interp, quat_interp)
+            trajectory.append(pose_matrix)
+    
+    pos_final, quat_final = convert_tartanair_to_gen3c(
+        poses[-1, :3], torch.nn.functional.normalize(poses[-1, 3:], dim=0)
+    )
+    final_pose = pose_from_quaternion(pos_final, quat_final)
+    trajectory.append(final_pose)
+    trajectory = torch.stack(trajectory).to(device)
+
+    first_pose_inv = torch.linalg.inv(trajectory[0])
+    trajectory_camera_relative = torch.stack([first_pose_inv @ pose for pose in trajectory]).to(device)
+    return trajectory_camera_relative
+
+    #return apply_transformation(trajectory, world_to_camera_matrix)
+    
+    # exit()
+    # for pos in positions:
+    #     view_matrix = look_at_matrix(initial_camera_pos + pos, look_at + pos * 2)
+    #     trajectory.append(view_matrix)
+    # trajectory = torch.stack(trajectory)
+    # return apply_transformation(trajectory, world_to_camera_matrix)
+
+
+def create_fixed_trajectory(
+    world_to_camera_matrix, device="cuda"):
+    #poses = [[0,0,0,0,0,0,1],[0.5,0,1.5,0,0,0,1],[0.5,0,4.5,0,0,0,1],[0,0,6.5,0,0,0,1],[-1.0,0,7.5,0,0,0,1]] office1
+    poses = torch.tensor(poses, dtype=torch.float32, device=device)
+    n_segments = poses.shape[0] - 1
+    n_steps = 121
+    steps_per_segment = (n_steps - 1) // n_segments
+    translational_positions = []
+    look_at = torch.tensor([0.0, 0.0, 1.0]).to(device)
+    initial_camera_pos = torch.tensor([0,0,0],device=device)
+    for i in range(n_segments):
+        p0, p1 = poses[i], poses[i+1]
+        pos0, quat0 = p0[:3], torch.nn.functional.normalize(p0[3:],dim=0)
+        pos1, quat1 = p1[:3], torch.nn.functional.normalize(p1[3:],dim=0)
+        for j in range(steps_per_segment):
+            t = j / steps_per_segment
+            pos_interp = (1-t)*pos0 + t*pos1
+            quat_interp = slerp(quat0, quat1, t)
+            translational_positions.append(pos_interp)
+    
+    translational_positions.append(poses[-1,:3])
+    trajectory = []
+    for pos in translational_positions:
+        camera_pos = initial_camera_pos + pos
+        _look_at = look_at + pos * 2
+        view_matrix = look_at_matrix(camera_pos, _look_at)
+        trajectory.append(view_matrix)
+
+    #pos_final, quat_final = poses[-1,:3], torch.nn.functional.normalize(poses[-1,3:],dim=0)
+    #final_pose = pose_from_quaternion(pos_final, quat_final)
+    #trajectory.append(final_pose)
+    trajectory = torch.stack(trajectory).to(device)
+
+    return apply_transformation(trajectory, world_to_camera_matrix)
+
+    #first_pose_inv = torch.linalg.inv(trajectory[0])
+    #trajectory_camera_relative = torch.stack([first_pose_inv @ pose for pose in trajectory]).to(device)
+    #return trajectory_camera_relative
+
+
+
+def create_fixed_trajectory_old(
+    world_to_camera_matrix, device="cuda"):
+
+    center_depth = 1.0
+    look_at = torch.tensor([0.0, 0.0, center_depth]).to(device)
+    trajectory = []
+    translation_positions = []
+    initial_camera_pos = torch.tensor([0,0,0],device=device)
+
+    n_steps = 121
+    distance = 5.0
+
+    for i in range(60):
+        x = 0
+        y = 0
+        z = i*distance*center_depth / n_steps
+        translation_positions.append(torch.tensor([x,y,z],device=device))
+    
+    final_z = 60*distance*center_depth / n_steps
+    for i in range(60,n_steps):
+        t = (i-60)/(n_steps - 60)
+        #x = i * distance*center_depth / n_steps * -1
+        x = t * distance
+        y=0
+        z = final_z
+        #z= (1-t) * (60*distance*center_depth / n_steps)
+        translation_positions.append(torch.tensor([x,y,z],device=device))
+    
+    for pos in translation_positions:
+        camera_pos = initial_camera_pos + pos
+        _look_at = look_at + pos * 2
+        view_matrix = look_at_matrix(camera_pos, _look_at)
+        trajectory.append(view_matrix)
+    trajectory = torch.stack(trajectory)
+    return apply_transformation(trajectory, world_to_camera_matrix)
+
 
 def create_spiral_trajectory(
     world_to_camera_matrix,
@@ -147,6 +323,7 @@ def generate_camera_trajectory(
     movement_distance: float,
     camera_rotation: str,
     center_depth: float = 1.0,
+    poses_file: str = None,
     device: str = "cuda",
 ):
     """
@@ -178,6 +355,19 @@ def generate_camera_trajectory(
             camera_rotation=camera_rotation,
             radius_x=movement_distance,
             radius_y=movement_distance,
+        )
+    elif trajectory_type == "fixed":
+        positive = True
+        new_w2cs_seq = create_fixed_trajectory(
+                world_to_camera_matrix=initial_w2c,
+                device=device,
+        )
+    elif trajectory_type == "posed":
+        new_w2cs_seq = create_posed_trajectory(
+            world_to_camera_matrix=initial_w2c,
+            poses_file = poses_file,
+            n_steps = num_frames, 
+            device=device,
         )
     else:
         if trajectory_type == "left":
@@ -247,11 +437,20 @@ def _align_inv_depth_to_depth(
     else:
         target_mask = torch.logical_and(target_mask > 0, target_depth_mask)
 
+    #Safety: ensure we have valid pixels
+    if source_mask.sum() < 10 or target_mask.sum() < 10:
+        return 1.0/(source_inv_depth+1e-6)
+
     # Remove outliers
     outlier_quantiles = torch.tensor([0.1, 0.9], device=source_inv_depth.device)
 
-    source_data_low, source_data_high = torch.quantile(source_inv_depth[source_mask], outlier_quantiles)
-    target_data_low, target_data_high = torch.quantile(target_inv_depth[target_mask], outlier_quantiles)
+    #add try-except logic
+    try:
+        source_data_low, source_data_high = torch.quantile(source_inv_depth[source_mask], outlier_quantiles)
+        target_data_low, target_data_high = torch.quantile(target_inv_depth[target_mask], outlier_quantiles)
+    except RuntimeError:
+        #Fallback: skip alignment if quantile fails
+        return 1.0/(source_inv_depth+1e-6)
     source_mask = (source_inv_depth > source_data_low) & (source_inv_depth < source_data_high)
     target_mask = (target_inv_depth > target_data_low) & (target_inv_depth < target_data_high)
 

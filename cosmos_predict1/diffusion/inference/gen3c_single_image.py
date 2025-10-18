@@ -17,6 +17,7 @@ import argparse
 import os
 import cv2
 from moge.model.v1 import MoGeModel
+from moge.model.v2 import MoGeModel as MoGeModel2
 import torch
 import numpy as np
 from cosmos_predict1.diffusion.inference.inference_utils import (
@@ -31,6 +32,8 @@ from cosmos_predict1.diffusion.inference.cache_3d import Cache3D_Buffer
 from cosmos_predict1.diffusion.inference.camera_utils import generate_camera_trajectory
 import torch.nn.functional as F
 torch.enable_grad(False)
+
+import matplotlib.pyplot as plt
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Video to world generation demo script")
@@ -60,6 +63,8 @@ def create_parser() -> argparse.ArgumentParser:
             "zoom_out",
             "clockwise",
             "counterclockwise",
+            "fixed",
+            "posed",
             "none",
         ],
         default="left",
@@ -100,6 +105,12 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="If set, use foreground masking for the warped images.",
     )
+    parser.add_argument(
+        "--poses_file",
+        type=str,
+        default=None,
+        help="poses of the fixed trajectory (waypoints)"
+    )
     return parser
 
 def parse_arguments() -> argparse.Namespace:
@@ -130,6 +141,7 @@ def _predict_moge_depth(current_image_path: str | np.ndarray,
     del current_image_path
 
     depth_pred_h, depth_pred_w = 720, 1280
+    #depth_pred_h, depth_pred_w = 640,640
 
     input_image_for_depth_resized = cv2.resize(input_image_rgb, (depth_pred_w, depth_pred_h))
     input_image_for_depth_tensor_chw = torch.tensor(input_image_for_depth_resized / 255.0, dtype=torch.float32, device=device).permute(2, 0, 1)
@@ -272,6 +284,8 @@ def demo(args):
         num_steps=args.num_steps,
         height=args.height,
         width=args.width,
+        #height=640,
+        #width=640,
         fps=args.fps,
         num_video_frames=121,
         seed=args.seed,
@@ -280,7 +294,8 @@ def demo(args):
     frame_buffer_max = pipeline.model.frame_buffer_max
     generator = torch.Generator(device=device).manual_seed(args.seed)
     sample_n_frames = pipeline.model.chunk_size
-    moge_model = MoGeModel.from_pretrained("Ruicheng/moge-vitl").to(device)
+    #moge_model = MoGeModel.from_pretrained("Ruicheng/moge-vitl").to(device)
+    moge_model = MoGeModel2.from_pretrained("Ruicheng/moge-2-vitl").to(device)
 
     if args.num_gpus > 1:
         pipeline.model.net.enable_context_parallel(process_group)
@@ -318,7 +333,21 @@ def demo(args):
             moge_intrinsics_b133,
         ) = _predict_moge_depth(
             current_image_path, args.height, args.width, device, moge_model
+            #current_image_path, 640, 640, device, moge_model
         )
+
+        # import matplotlib.pyplot as plt 
+        # #from pdb import set_trace as bp; bp()
+        # init_depth_map = moge_depth_b11hw[0,0,0].cpu()
+        # plt.figure(figsize=(8,5))
+        # im = plt.imshow(init_depth_map, cmap='plasma', vmin=0.5, vmax=200)
+        # plt.colorbar(im, label="Depth (m)")
+        # plt.title("Metric depth map")
+        # plt.axis('off')
+        # plt.tight_layout()
+        # plt.savefig('assets/diffusion/tartanair/depth_colormap_57_moge2.png')
+        # plt.close()
+        # exit()
 
         cache = Cache3D_Buffer(
             frame_buffer_max=frame_buffer_max,
@@ -346,21 +375,60 @@ def demo(args):
                 movement_distance=args.movement_distance,
                 camera_rotation=args.camera_rotation,
                 center_depth=1.0,
+                poses_file=args.poses_file,
                 device=device.type,
             )
         except (ValueError, NotImplementedError) as e:
             log.critical(f"Failed to generate trajectory: {e}")
             continue
+        
+        print("generated_w2cs 0", generated_w2cs[0,0,:,:])
+        print("generated_w2cs 60", generated_w2cs[0,60,:,:])
+        print("generated_intrinsics 0", generated_intrinsics[0,0,:,:])
+        print("generated_intrinsics 60", generated_intrinsics[0,60,:,:])
+        print("finished generating camera trajectory")
 
         log.info(f"Generating 0 - {sample_n_frames} frames")
         rendered_warp_images, rendered_warp_masks = cache.render_cache(
             generated_w2cs[:, 0:sample_n_frames],
             generated_intrinsics[:, 0:sample_n_frames],
         )
+        print("finished cache.render_cache")
+
+        save_dir = "rendered_warp_images_test_1018"
+        os.makedirs(save_dir, exist_ok=True)
+
+        rwi = rendered_warp_images
+        num_frames = rwi.shape[1]
+
+        # print("rendered_warp_images", rendered_warp_images.shape)
+        # print("rendered_warp_masks", rendered_warp_masks.shape)
+        # exit()
+
+        save_rendered_war_images = False
+        if save_rendered_war_images:
+            print("saving rendered warp images")
+            for i in range(num_frames):
+                img = rwi[0, i, 0].permute(1, 2, 0).cpu().numpy()  # (H, W, C)
+                img_display = (img + 1.0) / 2.0  # scale from [-1,1] -> [0,1]
+                img_display = img_display.clip(0, 1)  # ensure valid range
+                
+                save_path = os.path.join(save_dir, f"frame_{i:03d}.png")
+                plt.imshow(img_display)
+                plt.axis('off')
+                plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
+                plt.close()
+            print("done saving all frames")
+
+            exit()
 
         all_rendered_warps = []
         if args.save_buffer:
             all_rendered_warps.append(rendered_warp_images.clone().cpu())
+        
+        print("generated_w2cs shape", generated_w2cs.shape)
+        print("generated_intrinsics shape", generated_intrinsics.shape)
+        print("sample_n_frames", sample_n_frames)
 
         # Generate video
         generated_output = pipeline.generate(
@@ -374,6 +442,8 @@ def demo(args):
             log.critical("Guardrail blocked video2world generation.")
             continue
         video, prompt = generated_output
+
+        print("generated_output, line 442 done")
 
         num_ar_iterations = (generated_w2cs.shape[1] - 1) // (sample_n_frames - 1)
         for num_iter in range(1, num_ar_iterations):
